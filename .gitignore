@@ -1,0 +1,5 @@
+﻿__pycache__/
+.mplcache/
+logs/
+reports/
+*.pyc
