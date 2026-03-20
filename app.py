@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import base64
+from urllib import error, request
 
 import cv2
 import tkinter as tk
@@ -86,6 +88,16 @@ class StudyGuardianApp:
         self.alert_threshold_var = tk.StringVar(value="30")
         ttk.Entry(controls, textvariable=self.alert_threshold_var, width=5).pack(side="left", padx=6)
 
+        ttk.Label(controls, text="检测方式:").pack(side="left")
+        self.detector_mode_var = tk.StringVar(value="本地规则")
+        ttk.Combobox(
+            controls,
+            textvariable=self.detector_mode_var,
+            values=["本地规则", "本地Qwen模型"],
+            width=10,
+            state="readonly",
+        ).pack(side="left", padx=6)
+
         self.start_btn = ttk.Button(controls, text="开始监督", command=self.start_session)
         self.start_btn.pack(side="left", padx=6)
         self.stop_btn = ttk.Button(controls, text="结束监督", command=self.stop_session, state="disabled")
@@ -125,6 +137,14 @@ class StudyGuardianApp:
         self.alert_cooldown = 0.0
         self.alert_threshold_seconds = 30
         self.bad_streak_seconds = 0
+        self.qwen_interval_seconds = int(os.getenv("LOCAL_VLM_INTERVAL_SECONDS", "2"))
+        self.qwen_base_url = os.getenv("LOCAL_VLM_BASE_URL", "http://127.0.0.1:11434/v1")
+        self.qwen_model_name = os.getenv("LOCAL_VLM_MODEL", "qwen2.5vl:3b")
+        self.qwen_api_key = os.getenv("LOCAL_VLM_API_KEY", "")
+        self.qwen_infer_running = False
+        self.qwen_next_submit_ts = 0.0
+        self.qwen_result_lock = threading.Lock()
+        self.qwen_last_result = ("专注", "本地Qwen待命")
 
         self.plan: list[tuple[str, int]] = []
         self.plan_index = 0
@@ -184,6 +204,9 @@ class StudyGuardianApp:
         self.phone_suspect_frames = 0
         self.bad_streak_seconds = 0
         self.alert_threshold_seconds = alert_threshold
+        self.qwen_infer_running = False
+        self.qwen_next_submit_ts = 0.0
+        self.qwen_last_result = ("专注", "本地Qwen待命")
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -223,7 +246,10 @@ class StudyGuardianApp:
 
             frame = cv2.flip(frame, 1)
             h, _ = frame.shape[:2]
-            state, reason, color, box = self._infer_attention_state(frame)
+            if self.detector_mode_var.get() == "本地Qwen模型":
+                state, reason, color, box = self._infer_attention_state_qwen(frame)
+            else:
+                state, reason, color, box = self._infer_attention_state_local(frame)
 
             if box is not None:
                 x, y, fw, fh = box
@@ -244,6 +270,101 @@ class StudyGuardianApp:
 
             self._tick_state(state)
             time.sleep(0.07)
+
+    def _infer_attention_state_qwen(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+        if len(faces) == 0:
+            return "离开座位", "未检测到人脸", (0, 0, 255), None
+
+        box = max([tuple(f) for f in faces], key=lambda f: f[2] * f[3])
+        now = time.time()
+        if (not self.qwen_infer_running) and now >= self.qwen_next_submit_ts:
+            self.qwen_infer_running = True
+            self.qwen_next_submit_ts = now + max(1, self.qwen_interval_seconds)
+            threading.Thread(target=self._qwen_infer_worker, args=(frame.copy(),), daemon=True).start()
+
+        with self.qwen_result_lock:
+            state, reason = self.qwen_last_result
+
+        if state == "疑似玩手机":
+            return state, reason, (0, 165, 255), box
+        return "专注", reason, (0, 180, 0), box
+
+    def _qwen_infer_worker(self, frame):
+        try:
+            result = self._call_local_qwen_phone_classifier(frame)
+            with self.qwen_result_lock:
+                self.qwen_last_result = result
+        finally:
+            self.qwen_infer_running = False
+
+    def _call_local_qwen_phone_classifier(self, frame):
+        try:
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            if not ok:
+                return ("专注", "Qwen编码失败")
+            b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+
+            prompt = (
+                "你是学习监督视觉分类器。只判断当前帧中的人是否在玩手机。"
+                "若低头并手持手机或明显在看手机屏幕，判定phone=true；否则false。"
+                "请仅返回JSON：{\"phone\":true/false,\"reason\":\"<=12字\"}"
+            )
+            payload = {
+                "model": self.qwen_model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 80,
+            }
+            req = request.Request(
+                url=f"{self.qwen_base_url.rstrip('/')}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    **({"Authorization": f"Bearer {self.qwen_api_key}"} if self.qwen_api_key else {}),
+                },
+                method="POST",
+            )
+            with request.urlopen(req, timeout=8) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = "".join([p.get("text", "") for p in content if isinstance(p, dict)])
+
+            parsed = None
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                if "{" in str(content) and "}" in str(content):
+                    snippet = str(content)[str(content).find("{") : str(content).rfind("}") + 1]
+                    try:
+                        parsed = json.loads(snippet)
+                    except Exception:
+                        parsed = None
+
+            if isinstance(parsed, dict):
+                is_phone = bool(parsed.get("phone", False))
+                reason = str(parsed.get("reason", "Qwen判定"))[:18]
+                return ("疑似玩手机", reason) if is_phone else ("专注", reason)
+
+            text = str(content)
+            if "phone" in text.lower() or "玩手机" in text:
+                return ("疑似玩手机", "Qwen文本判定")
+            return ("专注", "Qwen文本判定")
+        except error.HTTPError as e:
+            return ("专注", f"Qwen请求失败({e.code})")
+        except Exception:
+            return ("专注", "Qwen超时/异常")
 
     def _detect_phone_like_object(self, gray_frame, face_box):
         h, w = gray_frame.shape[:2]
@@ -279,7 +400,7 @@ class StudyGuardianApp:
             return True
         return False
 
-    def _infer_attention_state(self, frame):
+    def _infer_attention_state_local(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = frame.shape[:2]
 
