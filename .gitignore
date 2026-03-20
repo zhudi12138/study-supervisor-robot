@@ -3,3 +3,5 @@
 logs/
 reports/
 *.pyc
+
+yolov8n.pt

@@ -1,17 +1,21 @@
 ﻿import datetime as dt
 import json
 import os
+import platform
+import random
+import shutil
+import subprocess
 import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
-import base64
-from urllib import error, request
-
 import cv2
+import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox
+from PIL import Image, ImageDraw, ImageFont
+from ultralytics import YOLO
 
 os.environ.setdefault("MPLCONFIGDIR", str((Path(__file__).resolve().parent / ".mplcache")))
 
@@ -19,11 +23,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-try:
-    import winsound
-except ImportError:
-    winsound = None
 
 
 APP_NAME = "Study Guardian AI"
@@ -89,13 +88,13 @@ class StudyGuardianApp:
         ttk.Entry(controls, textvariable=self.alert_threshold_var, width=5).pack(side="left", padx=6)
 
         ttk.Label(controls, text="检测方式:").pack(side="left")
-        self.detector_mode_var = tk.StringVar(value="本地规则")
+        self.detector_mode_var = tk.StringVar(value="YOLO(人+手机)")
         ttk.Combobox(
             controls,
             textvariable=self.detector_mode_var,
-            values=["本地规则", "本地Qwen模型"],
-            width=10,
-            state="readonly",
+            values=["YOLO(人+手机)"],
+            width=12,
+            state="disabled",
         ).pack(side="left", padx=6)
 
         self.start_btn = ttk.Button(controls, text="开始监督", command=self.start_session)
@@ -137,14 +136,14 @@ class StudyGuardianApp:
         self.alert_cooldown = 0.0
         self.alert_threshold_seconds = 30
         self.bad_streak_seconds = 0
-        self.qwen_interval_seconds = int(os.getenv("LOCAL_VLM_INTERVAL_SECONDS", "2"))
-        self.qwen_base_url = os.getenv("LOCAL_VLM_BASE_URL", "http://127.0.0.1:11434/v1")
-        self.qwen_model_name = os.getenv("LOCAL_VLM_MODEL", "qwen2.5vl:3b")
-        self.qwen_api_key = os.getenv("LOCAL_VLM_API_KEY", "")
-        self.qwen_infer_running = False
-        self.qwen_next_submit_ts = 0.0
-        self.qwen_result_lock = threading.Lock()
-        self.qwen_last_result = ("专注", "本地Qwen待命")
+        self.last_voice_ts = 0.0
+        self.voice_cooldown_seconds = 10
+        self.yolo_model_name = os.getenv("YOLO_MODEL", "yolov8n.pt")
+        self.yolo_conf = float(os.getenv("YOLO_CONF", "0.35"))
+        self.yolo_every_n_frames = int(os.getenv("YOLO_EVERY_N_FRAMES", "2"))
+        self.yolo_model = None
+        self.yolo_frame_count = 0
+        self.yolo_last_result = ("专注", "YOLO待命", (0, 180, 0), None)
 
         self.plan: list[tuple[str, int]] = []
         self.plan_index = 0
@@ -161,6 +160,7 @@ class StudyGuardianApp:
         self.pet_window = None
         self.pet_canvas = None
         self.pet_message_var = tk.StringVar(value="汪~准备好学习了吗？")
+        self.overlay_font = self._load_overlay_font(30)
 
     def start_session(self):
         if self.running:
@@ -188,7 +188,13 @@ class StudyGuardianApp:
 
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
-            messagebox.showerror("摄像头错误", "无法打开摄像头，请检查权限或是否被其他程序占用。")
+            if platform.system() == "Darwin":
+                messagebox.showerror(
+                    "摄像头错误",
+                    "无法打开摄像头。请到 系统设置 -> 隐私与安全性 -> 相机，允许 Python/终端 访问后重试。",
+                )
+            else:
+                messagebox.showerror("摄像头错误", "无法打开摄像头，请检查权限或是否被其他程序占用。")
             return
 
         self.running = True
@@ -204,9 +210,16 @@ class StudyGuardianApp:
         self.phone_suspect_frames = 0
         self.bad_streak_seconds = 0
         self.alert_threshold_seconds = alert_threshold
-        self.qwen_infer_running = False
-        self.qwen_next_submit_ts = 0.0
-        self.qwen_last_result = ("专注", "本地Qwen待命")
+        self.yolo_frame_count = 0
+        self.yolo_last_result = ("专注", "YOLO待命", (0, 180, 0), None)
+        if self.yolo_model is None:
+            try:
+                self.yolo_model = YOLO(self.yolo_model_name)
+            except Exception as e:
+                messagebox.showerror("YOLO加载失败", f"无法加载模型 {self.yolo_model_name}:\n{e}")
+                self.cap.release()
+                self.cap = None
+                return
 
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -246,21 +259,23 @@ class StudyGuardianApp:
 
             frame = cv2.flip(frame, 1)
             h, _ = frame.shape[:2]
-            if self.detector_mode_var.get() == "本地Qwen模型":
-                state, reason, color, box = self._infer_attention_state_qwen(frame)
-            else:
-                state, reason, color, box = self._infer_attention_state_local(frame)
+            state, reason, color, box = self._infer_attention_state_yolo(frame)
 
             if box is not None:
                 x, y, fw, fh = box
                 cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
 
             phase_cn = "学习" if self.current_phase_kind == "study" else "休息"
-            cv2.putText(frame, f"Phase: {phase_cn}", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (230, 230, 230), 2)
-            cv2.putText(frame, f"State: {state}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-            cv2.putText(frame, f"Reason: {reason}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             ts = dt.datetime.now().strftime("%H:%M:%S")
-            cv2.putText(frame, ts, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
+            frame = self._draw_overlay_text(
+                frame,
+                [
+                    (f"阶段: {phase_cn}", (20, 20), (235, 235, 235)),
+                    (f"状态: {state}", (20, 62), color),
+                    (f"依据: {reason}", (20, 102), color),
+                    (f"时间: {ts}", (20, h - 50), (220, 220, 220)),
+                ],
+            )
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = cv2.imencode(".png", frame_rgb)[1].tobytes()
@@ -271,194 +286,106 @@ class StudyGuardianApp:
             self._tick_state(state)
             time.sleep(0.07)
 
-    def _infer_attention_state_qwen(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-        if len(faces) == 0:
-            return "离开座位", "未检测到人脸", (0, 0, 255), None
+    def _load_overlay_font(self, size: int):
+        font_candidates = [
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/msyhbd.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ]
+        for path in font_candidates:
+            if Path(path).exists():
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
 
-        box = max([tuple(f) for f in faces], key=lambda f: f[2] * f[3])
-        now = time.time()
-        if (not self.qwen_infer_running) and now >= self.qwen_next_submit_ts:
-            self.qwen_infer_running = True
-            self.qwen_next_submit_ts = now + max(1, self.qwen_interval_seconds)
-            threading.Thread(target=self._qwen_infer_worker, args=(frame.copy(),), daemon=True).start()
+    def _draw_overlay_text(self, frame, lines):
+        # OpenCV uses BGR; Pillow uses RGB
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img)
+        for text, (x, y), color_bgr in lines:
+            color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+            draw.text((x, y), text, font=self.overlay_font, fill=color_rgb)
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-        with self.qwen_result_lock:
-            state, reason = self.qwen_last_result
+    def _infer_attention_state_yolo(self, frame):
+        if self.yolo_model is None:
+            return "专注", "YOLO未加载", (0, 180, 0), None
 
-        if state == "疑似玩手机":
-            return state, reason, (0, 165, 255), box
-        return "专注", reason, (0, 180, 0), box
+        self.yolo_frame_count += 1
+        if self.yolo_frame_count % max(1, self.yolo_every_n_frames) != 0:
+            return self.yolo_last_result
 
-    def _qwen_infer_worker(self, frame):
         try:
-            result = self._call_local_qwen_phone_classifier(frame)
-            with self.qwen_result_lock:
-                self.qwen_last_result = result
-        finally:
-            self.qwen_infer_running = False
-
-    def _call_local_qwen_phone_classifier(self, frame):
-        try:
-            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-            if not ok:
-                return ("专注", "Qwen编码失败")
-            b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
-
-            prompt = (
-                "你是学习监督视觉分类器。只判断当前帧中的人是否在玩手机。"
-                "若低头并手持手机或明显在看手机屏幕，判定phone=true；否则false。"
-                "请仅返回JSON：{\"phone\":true/false,\"reason\":\"<=12字\"}"
-            )
-            payload = {
-                "model": self.qwen_model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                        ],
-                    }
-                ],
-                "temperature": 0.1,
-                "max_tokens": 80,
-            }
-            req = request.Request(
-                url=f"{self.qwen_base_url.rstrip('/')}/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    **({"Authorization": f"Bearer {self.qwen_api_key}"} if self.qwen_api_key else {}),
-                },
-                method="POST",
-            )
-            with request.urlopen(req, timeout=8) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
-            data = json.loads(raw)
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if isinstance(content, list):
-                content = "".join([p.get("text", "") for p in content if isinstance(p, dict)])
-
-            parsed = None
-            try:
-                parsed = json.loads(content)
-            except Exception:
-                if "{" in str(content) and "}" in str(content):
-                    snippet = str(content)[str(content).find("{") : str(content).rfind("}") + 1]
-                    try:
-                        parsed = json.loads(snippet)
-                    except Exception:
-                        parsed = None
-
-            if isinstance(parsed, dict):
-                is_phone = bool(parsed.get("phone", False))
-                reason = str(parsed.get("reason", "Qwen判定"))[:18]
-                return ("疑似玩手机", reason) if is_phone else ("专注", reason)
-
-            text = str(content)
-            if "phone" in text.lower() or "玩手机" in text:
-                return ("疑似玩手机", "Qwen文本判定")
-            return ("专注", "Qwen文本判定")
-        except error.HTTPError as e:
-            return ("专注", f"Qwen请求失败({e.code})")
+            result = self.yolo_model.predict(
+                source=frame,
+                conf=self.yolo_conf,
+                iou=0.5,
+                max_det=20,
+                imgsz=640,
+                verbose=False,
+            )[0]
         except Exception:
-            return ("专注", "Qwen超时/异常")
+            return "专注", "YOLO推理异常", (0, 180, 0), None
 
-    def _detect_phone_like_object(self, gray_frame, face_box):
-        h, w = gray_frame.shape[:2]
-        x, y, fw, fh = face_box
-        roi_top = min(h - 1, y + int(fh * 0.45))
-        roi_bottom = min(h, y + int(fh * 2.1))
-        roi_left = max(0, x - int(fw * 0.7))
-        roi_right = min(w, x + fw + int(fw * 0.7))
-        if roi_bottom - roi_top < 30 or roi_right - roi_left < 30:
+        persons = []
+        phones = []
+        if result.boxes is not None:
+            for b in result.boxes:
+                cls_id = int(b.cls[0].item())
+                x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
+                if cls_id == 0:
+                    persons.append((x1, y1, x2, y2))
+                elif cls_id == 67:
+                    phones.append((x1, y1, x2, y2))
+
+        if not persons:
+            self.yolo_last_result = ("离开座位", "YOLO未检测到人", (0, 0, 255), None)
+            return self.yolo_last_result
+
+        main_person = max(persons, key=lambda p: (p[2] - p[0]) * (p[3] - p[1]))
+        person_box = (main_person[0], main_person[1], main_person[2] - main_person[0], main_person[3] - main_person[1])
+
+        if not phones:
+            self.yolo_last_result = ("专注", "YOLO检测到人，未检测到手机", (0, 180, 0), person_box)
+            return self.yolo_last_result
+
+        phone_use = any(self._phone_belongs_to_person(main_person, ph) for ph in phones)
+        if phone_use:
+            self.yolo_last_result = ("疑似玩手机", "YOLO检测到人+手机", (0, 165, 255), person_box)
+        else:
+            self.yolo_last_result = ("专注", "YOLO手机不在本人附近", (0, 180, 0), person_box)
+        return self.yolo_last_result
+
+    def _phone_belongs_to_person(self, person_xyxy, phone_xyxy):
+        px1, py1, px2, py2 = person_xyxy
+        fx1, fy1, fx2, fy2 = phone_xyxy
+        pw = max(1, px2 - px1)
+        ph = max(1, py2 - py1)
+
+        ex1 = px1 - int(pw * 0.25)
+        ex2 = px2 + int(pw * 0.25)
+        ey1 = py1 + int(ph * 0.15)
+        ey2 = py2 + int(ph * 0.20)
+
+        cx = (fx1 + fx2) / 2
+        cy = (fy1 + fy2) / 2
+        if not (ex1 <= cx <= ex2 and ey1 <= cy <= ey2):
             return False
 
-        roi = gray_frame[roi_top:roi_bottom, roi_left:roi_right]
-        blur = cv2.GaussianBlur(roi, (5, 5), 0)
-        edges = cv2.Canny(blur, 60, 130)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for c in contours:
-            x2, y2, w2, h2 = cv2.boundingRect(c)
-            area = w2 * h2
-            if area < 1200:
-                continue
-            ratio = w2 / max(h2, 1)
-            if not (0.35 <= ratio <= 0.95):
-                continue
-            perimeter = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * perimeter, True)
-            if len(approx) < 4:
-                continue
-            rect_area = cv2.contourArea(approx)
-            fill_rate = rect_area / max(area, 1)
-            if fill_rate < 0.5:
-                continue
-            return True
-        return False
-
-    def _infer_attention_state_local(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        h, w = frame.shape[:2]
-
-        frontal_faces = self.face_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-        profile_faces = self.profile_classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-
-        flipped = cv2.flip(gray, 1)
-        right_profiles_raw = self.profile_classifier.detectMultiScale(flipped, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-        right_profiles = []
-        for (x, y, fw, fh) in right_profiles_raw:
-            right_profiles.append((w - x - fw, y, fw, fh))
-
-        all_faces = [("frontal", tuple(f)) for f in frontal_faces]
-        all_faces.extend(("profile", tuple(f)) for f in profile_faces)
-        all_faces.extend(("profile", tuple(f)) for f in right_profiles)
-
-        if not all_faces:
-            self.side_face_frames = max(0, self.side_face_frames - 1)
-            self.head_down_frames = max(0, self.head_down_frames - 1)
-            self.phone_suspect_frames = max(0, self.phone_suspect_frames - 1)
-            return "离开座位", "未检测到人脸", (0, 0, 255), None
-
-        face_type, box = max(all_faces, key=lambda item: item[1][2] * item[1][3])
-        x, y, fw, fh = box
-        cx = x + fw / 2
-        cy = y + fh / 2
-
-        roi_y2 = max(y + int(fh * 0.6), y + 1)
-        roi = gray[y:roi_y2, x : x + fw]
-        eyes = self.eye_classifier.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=6, minSize=(16, 16)) if roi.size else []
-
-        head_down = (len(eyes) == 0 and cy > h * 0.55)
-        off_center = abs(cx - w / 2) > w * 0.24 or abs(cy - h / 2) > h * 0.25
-        side_face = face_type == "profile" or (fw / max(fh, 1) < 0.72)
-        phone_like_object = self._detect_phone_like_object(gray, box)
-
-        if side_face:
-            self.side_face_frames += 1
-        else:
-            self.side_face_frames = max(0, self.side_face_frames - 1)
-
-        if head_down:
-            self.head_down_frames += 1
-        else:
-            self.head_down_frames = max(0, self.head_down_frames - 1)
-
-        if head_down and phone_like_object:
-            self.phone_suspect_frames += 1
-        else:
-            self.phone_suspect_frames = max(0, self.phone_suspect_frames - 1)
-
-        if self.phone_suspect_frames >= 3:
-            return "疑似玩手机", "低头+手机形态", (0, 165, 255), box
-        if self.head_down_frames >= 10 and off_center:
-            return "疑似玩手机", "持续低头偏离", (0, 165, 255), box
-        if self.side_face_frames >= 8 and self.head_down_frames >= 6:
-            return "疑似玩手机", "侧脸并持续低头", (0, 165, 255), box
-        return "专注", "姿态稳定", (0, 180, 0), box
+        f_area = max(1, (fx2 - fx1) * (fy2 - fy1))
+        inter_x1 = max(ex1, fx1)
+        inter_y1 = max(ey1, fy1)
+        inter_x2 = min(ex2, fx2)
+        inter_y2 = min(ey2, fy2)
+        if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+            return False
+        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+        return inter_area / f_area > 0.2
 
     def _tick_state(self, state: str):
         now = time.time()
@@ -492,28 +419,62 @@ class StudyGuardianApp:
             )
             self._set_pet_message(f"汪汪！检测到你可能在看手机 ({self.bad_streak_seconds}s)")
             if self.bad_streak_seconds >= self.alert_threshold_seconds:
-                self._maybe_alert()
+                self._maybe_alert(reason="phone")
                 self.bad_streak_seconds = 0
         else:
             self.stats.absent_seconds += dt_seconds
-            self.bad_streak_seconds += dt_seconds
-            self.tip_var.set(
-                f"提示：你已离开，连续 {self.bad_streak_seconds}s（阈值 {self.alert_threshold_seconds}s）。"
-            )
-            self._set_pet_message("汪？你去哪里啦，快回来学习。")
-            if self.bad_streak_seconds >= self.alert_threshold_seconds:
-                self._maybe_alert()
-                self.bad_streak_seconds = 0
+            self.bad_streak_seconds = 0
+            self.tip_var.set("提示：你已离开，离开时长会计入统计，不触发提醒。")
+            self._set_pet_message("我会帮你记录离开时长，回来后继续加油。")
 
-    def _maybe_alert(self):
+    def _maybe_alert(self, reason: str = "phone"):
         now = time.time()
         if now - self.alert_cooldown < 12:
             return
         self.alert_cooldown = now
         self.stats.alerts += 1
-        self._set_pet_message("汪！提醒一下，先把手机放下吧。")
-        if winsound:
-            winsound.Beep(950, 250)
+        if reason == "phone":
+            phrases = [
+                "先把手机放一边，我们回到当前任务。",
+                "注意力有点飘了，先回到学习节奏。",
+                "休息刷手机可以，学习阶段先专注一下。",
+                "我们再坚持几分钟，手机稍后再看。",
+            ]
+            text = random.choice(phrases)
+            self._set_pet_message(text)
+            self._speak_alert(text)
+
+    def _speak_alert(self, text: str):
+        now = time.time()
+        if now - self.last_voice_ts < self.voice_cooldown_seconds:
+            return
+        self.last_voice_ts = now
+        threading.Thread(target=self._speak_worker, args=(text,), daemon=True).start()
+
+    def _speak_worker(self, text: str):
+        try:
+            system = platform.system()
+            if system == "Darwin":
+                subprocess.run(["say", text], check=False, timeout=6)
+                return
+            if system == "Windows":
+                escaped = text.replace("'", "''")
+                ps = (
+                    "Add-Type -AssemblyName System.Speech; "
+                    "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                    "$s.Rate=0; "
+                    f"$s.Speak('{escaped}')"
+                )
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False, timeout=8)
+                return
+            if shutil.which("spd-say"):
+                subprocess.run(["spd-say", text], check=False, timeout=6)
+                return
+            if shutil.which("espeak"):
+                subprocess.run(["espeak", text], check=False, timeout=6)
+                return
+        except Exception:
+            return
 
     def _show_pet_assistant(self):
         if self.pet_window is not None and self.pet_window.winfo_exists():
@@ -586,7 +547,7 @@ class StudyGuardianApp:
         if remain <= 0:
             if not self._next_phase():
                 self.status_var.set("状态：计划完成")
-                self._maybe_alert()
+                self._speak_alert("学习计划完成，做得很好。")
                 self.stop_session()
                 messagebox.showinfo("学习完成", "本次计划已完成，日志和统计图可在 reports 中查看。")
                 return
@@ -607,12 +568,12 @@ class StudyGuardianApp:
             self.status_var.set("状态：休息阶段")
             self.tip_var.set("提示：休息中，喝水或起身活动一下。")
             self._set_pet_message("汪~先休息，等会继续学习。")
-            self._maybe_alert()
+            self._speak_alert("辛苦了，先休息一下。")
         else:
             self.status_var.set("状态：学习阶段")
             self.tip_var.set("提示：学习阶段开始，进入专注状态。")
             self._set_pet_message("汪！新一轮学习开始，专注起来。")
-            self._maybe_alert()
+            self._speak_alert("新的学习阶段开始了，我们继续。")
         return True
 
     def _render_stats(self, final: bool = False):

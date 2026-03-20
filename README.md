@@ -1,11 +1,11 @@
 ﻿# Study Guardian AI（学习监督桌面 AI）
 
-当前版本包含以下核心能力：
+当前版本核心能力：
 - 番茄钟模式（学习/休息循环）
-- 每日学习报告图表（自动汇总今日日志）
-- 多日趋势图（近14天 + 近8周）
-- 玩手机监督检测（本地规则 / 本地Qwen模型）
-- 可配置提醒策略（连续玩手机/离开达到阈值再提醒）
+- YOLO 识别人和手机（玩手机监督）
+- 悬浮小狗助手（状态提示）
+- 语音提醒（更自然口吻）
+- 每日/趋势统计图
 
 ## 1. 安装依赖
 
@@ -21,60 +21,37 @@ python app.py
 
 ## 3. 使用
 
-1. 选择模式：`番茄钟` 或 `单次学习`
-2. 设置学习分钟、休息分钟、循环次数
-3. 设置 `提醒阈值(秒)`（例如 30）
-4. 选择检测方式：`本地规则` 或 `本地Qwen模型`
-5. 点击“开始监督”
-6. 任何时候可点“结束监督”
-7. 点击“生成今日日报”生成当天柱状图
-8. 点击“生成趋势图”生成近14天和近8周趋势图
+1. 设置学习时长参数
+2. 点击“开始监督”
+3. 摄像头页会显示：阶段/状态/依据/时间（中文）
+4. 点击“结束监督”结束并保存日志
 
-## 4. 本地Qwen模型接入（不走云端）
+## 4. YOLO 判定逻辑
 
-程序使用 OpenAI 兼容接口调用本地多模态模型。
-
-### Ollama 示例
-
-```powershell
-# 先拉取可用的 Qwen VL 小模型（以你本机实际可用tag为准）
-ollama pull qwen2.5vl:3b
-
-# 设置环境变量（当前终端生效）
-$env:LOCAL_VLM_BASE_URL="http://127.0.0.1:11434/v1"
-$env:LOCAL_VLM_MODEL="qwen2.5vl:3b"
-
-python app.py
-```
-
-### LM Studio 示例
-
-```powershell
-$env:LOCAL_VLM_BASE_URL="http://127.0.0.1:1234/v1"
-$env:LOCAL_VLM_MODEL="你的已加载模型名"
-python app.py
-```
-
-可选环境变量：
-- `LOCAL_VLM_INTERVAL_SECONDS`：请求间隔秒数（默认 2）
-- `LOCAL_VLM_API_KEY`：如果你的本地服务要求 token 再设置
+- `离开座位`：YOLO 未检测到 person
+- `疑似玩手机`：YOLO 检测到 person + cell phone，且手机在监督对象附近
+- `专注`：检测到人但未满足玩手机条件
 
 ## 5. 提醒策略
 
-- 学习阶段下，若 `玩手机/离开` 连续达到阈值秒数才触发提醒
-- 专注后连续计时清零
-- 休息阶段不累计该阈值计时
+- 仅对“疑似玩手机”触发语音提醒
+- 人物离开画面只计入离开时长，不提醒
 
-## 6. 输出文件
+## 6. macOS 说明
+
+- 若摄像头打不开：系统设置 -> 隐私与安全性 -> 相机，允许 Python/终端
+- 语音提醒使用系统 `say`
+
+## 7. 输出文件
 
 - 会话日志：`logs/session_YYYYmmdd_HHMMSS.json`
 - 日报图表：`reports/daily_YYYYmmdd.png`
-- 日报汇总：`reports/daily_YYYYmmdd.json`
 - 趋势图：`reports/trend_YYYYmmdd.png`
-- 趋势汇总：`reports/trend_YYYYmmdd.json`
 
-## 7. 隐私
+## 8. 依赖说明
 
-- 默认仅本地运行与本地存储
-- 默认不上传云端
-- 默认不保存视频流，仅保存统计数据
+YOLO 使用 `ultralytics`，默认模型为 `yolov8n.pt`，可通过环境变量覆盖：
+
+- `YOLO_MODEL`（默认 `yolov8n.pt`）
+- `YOLO_CONF`（默认 `0.35`）
+- `YOLO_EVERY_N_FRAMES`（默认 `2`）
